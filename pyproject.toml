@@ -28,6 +28,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.0.0",
+    "pywin32>=306",
 ]
 
 [project.urls]

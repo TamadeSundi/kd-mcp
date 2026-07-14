@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Optional, Union
 
 from mcp.server.fastmcp import FastMCP
 
@@ -53,13 +53,22 @@ class KdProcess:
     """
 
     def __init__(self, args: list[str]) -> None:
+        startupinfo = None
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+            creationflags |= subprocess.CREATE_NEW_CONSOLE
+
         self.proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=-1,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
         )
         self._buf = ""
         self._lock = threading.Lock()
@@ -146,11 +155,227 @@ class KdProcess:
 
 
 # ---------------------------------------------------------------------------
+# KdNamedPipe -- named-pipe wrapper with the same interface as KdProcess
+# ---------------------------------------------------------------------------
+
+class KdNamedPipe:
+    """
+    Wraps a Windows named pipe that kd.exe connects to via -k com:pipe,port=<name>.
+    The pipe is created here; kd.exe is launched separately and connects as a client.
+    Provides the same public API as KdProcess so all MCP tools work unchanged.
+    """
+
+    def __init__(self, pipe_name: str, args: list[str]) -> None:
+        import win32event
+        import win32file
+        import win32pipe
+
+        self.pipe_name = pipe_name
+        self._buf = ""
+        self._lock = threading.Lock()
+        self._ev = threading.Event()
+        self._shutdown = threading.Event()
+        self._pipe: Optional[object] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self._th: Optional[threading.Thread] = None
+
+        # Create the named pipe server side (byte-mode for COM serial stream).
+        self._pipe = win32pipe.CreateNamedPipe(
+            pipe_name,
+            win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
+            win32pipe.PIPE_TYPE_BYTE
+            | win32pipe.PIPE_READMODE_BYTE
+            | win32pipe.PIPE_WAIT,
+            255,                 # max instances
+            4096,               # out buffer
+            4096,               # in buffer
+            0,                  # default timeout
+            None,               # security
+        )
+
+        try:
+            # Launch kd.exe which will connect to the pipe.
+            self.proc = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+
+            # Wait for kd.exe to connect to the pipe (60s timeout).
+            overlapped = win32file.OVERLAPPED()
+            overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+            try:
+                win32file.ConnectNamedPipe(self._pipe, overlapped)
+                rc = win32event.WaitForSingleObject(overlapped.hEvent, 60_000)
+                if rc != win32event.WAIT_OBJECT_0:
+                    raise TimeoutError(
+                        f"Timeout waiting for kd.exe to connect to {pipe_name}"
+                    )
+            finally:
+                win32file.CloseHandle(overlapped.hEvent)
+        except:
+            # Clean up pipe and process on any failure.
+            self._cleanup_on_init_failure()
+            raise
+
+        self._th = threading.Thread(target=self._reader, daemon=True, name="kd-np-reader")
+        self._th.start()
+
+    def _cleanup_on_init_failure(self) -> None:
+        """Clean up pipe handle and kd.exe process if __init__ fails partway."""
+        import win32file
+        if self._pipe is not None:
+            try:
+                win32file.CloseHandle(self._pipe)
+            except Exception:
+                pass
+            self._pipe = None
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self.proc = None
+
+    def _reader(self) -> None:
+        import win32event
+        import win32file
+
+        while not self._shutdown.is_set():
+            pipe = self._pipe
+            if pipe is None:
+                break
+            evt = None
+            try:
+                overlapped = win32file.OVERLAPPED()
+                evt = win32event.CreateEvent(None, True, False, None)
+                overlapped.hEvent = evt
+                try:
+                    rc, data = win32file.ReadFile(pipe, 4096, overlapped)
+                except Exception:
+                    break
+                if rc == 997:  # ERROR_IO_PENDING
+                    # Wait with periodic checks so shutdown can interrupt.
+                    while not self._shutdown.is_set():
+                        wrc = win32event.WaitForSingleObject(evt, 500)
+                        if wrc == win32event.WAIT_OBJECT_0:
+                            break
+                    if self._shutdown.is_set():
+                        break
+                    try:
+                        _, data = win32file.GetOverlappedResult(pipe, overlapped, False)
+                    except Exception:
+                        break
+                elif rc != 0:
+                    # Unexpected error (e.g., broken pipe).
+                    break
+                if not data:
+                    if self.proc and self.proc.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                    continue
+                with self._lock:
+                    self._buf += data.decode("utf-8", errors="replace")
+                self._ev.set()
+            except Exception:
+                break
+            finally:
+                if evt is not None:
+                    try:
+                        win32file.CloseHandle(evt)
+                    except Exception:
+                        pass
+        self._ev.set()
+
+    # -- public API (same as KdProcess) ------------------------------------
+
+    def expect(self, pattern: re.Pattern, timeout: float = 30.0) -> str:
+        accumulated = ""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                accumulated += self._buf
+                self._buf = ""
+            if pattern.search(accumulated):
+                return accumulated
+            if self.proc and self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"kd.exe exited (code {self.proc.returncode}). "
+                    f"Last output:\n{accumulated[-1000:]}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timeout ({timeout}s) waiting for pattern. "
+                    f"Last output:\n{accumulated[-2000:]}"
+                )
+            self._ev.wait(min(remaining, 0.15))
+            self._ev.clear()
+
+    def sendline(self, cmd: str) -> None:
+        import win32file
+        if self._pipe is None:
+            raise RuntimeError("Pipe is closed -- not connected.")
+        win32file.WriteFile(self._pipe, (cmd + "\r\n").encode())
+
+    def send_break(self) -> None:
+        if self.proc:
+            try:
+                os.kill(self.proc.pid, signal.CTRL_BREAK_EVENT)
+            except Exception:
+                pass
+
+    def is_alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def kill(self) -> None:
+        import win32file
+        import win32pipe
+        # Signal the reader thread to stop.
+        self._shutdown.set()
+        if self._pipe is not None:
+            # Cancel any pending overlapped I/O on the pipe.
+            try:
+                win32file.CancelIoEx(self._pipe, None)
+            except Exception:
+                pass
+            try:
+                win32pipe.DisconnectNamedPipe(self._pipe)
+            except Exception:
+                pass
+        # Wait for the reader thread to exit before closing the handle.
+        if self._th is not None:
+            self._th.join(timeout=2)
+        if self._pipe is not None:
+            try:
+                win32file.CloseHandle(self._pipe)
+            except Exception:
+                pass
+            self._pipe = None
+        if self.proc is not None:
+            for fn in (self.proc.terminate, self.proc.kill):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+    def drain(self) -> None:
+        with self._lock:
+            self._buf = ""
+
+
+# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 
 class _State:
-    kd: Optional[KdProcess] = None
+    kd: Optional[Union[KdProcess, KdNamedPipe]] = None
 
 STATE = _State()
 mcp = FastMCP("kd")
@@ -160,7 +385,7 @@ mcp = FastMCP("kd")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require() -> KdProcess:
+def _require() -> Union[KdProcess, KdNamedPipe]:
     if STATE.kd is None or not STATE.kd.is_alive():
         raise RuntimeError("Not connected -- call kernel_attach first.")
     return STATE.kd
@@ -179,6 +404,28 @@ def _cmd(cmd: str, timeout: float = 20.0) -> str:
     if lines and lines[0].strip() == cmd.strip():
         out = "\n".join(lines[1:]).strip()
     return out
+
+
+def _kill_stale_kd(pipe_name: str) -> None:
+    """Kill any kd.exe processes left over from a previous server session.
+
+    After a server restart STATE.kd is None, but a stale kd.exe from the
+    old session may still be running -- holding the named pipe open (causing
+    ERROR_PIPE_BUSY 231) or keeping the kernel debug connection locked
+    ("another debugger is connected").  Kill *all* kd.exe processes to
+    guarantee a clean slate.
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "kd.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        # Give the OS a moment to release pipe handles and debug sessions.
+        time.sleep(1.0)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +463,7 @@ def kernel_attach(
         STATE.kd.kill()
     STATE.kd = None
 
-    args = [KD_EXE, "-k", connect_string]
+    args = [KD_EXE, "-bonc", "-k", connect_string]
 
     try:
         STATE.kd = KdProcess(args)
@@ -243,16 +490,8 @@ def kernel_attach(
         if remaining <= 0:
             break
         try:
-            # Phase 1: wait for TCP connect OR full KD handshake.
-            # On a running system kd.exe fires "Connected to target" first;
-            # the kernel won't complete the KD handshake until we break in.
-            # On a boot-break system the full handshake arrives on its own.
-            out = STATE.kd.expect(_ANY_CONNECTED_RE, timeout=remaining)
-            # Phase 2: send break always.  Harmless if the kernel is already
-            # halted (boot break); required to trigger the KD handshake on a
-            # running system.
-            STATE.kd.send_break()
-            out += STATE.kd.expect(_PROMPT_RE, timeout=60)
+            # Since we use -bonc, kd.exe will automatically break in as soon as it connects.
+            out = STATE.kd.expect(_PROMPT_RE, timeout=remaining)
             ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
             return {
                 "status": "connected",
@@ -293,7 +532,7 @@ def status() -> dict:
     """Return current debugger connection state."""
     if STATE.kd is None or not STATE.kd.is_alive():
         return {"connected": False}
-    return {"connected": True, "pid": STATE.kd.proc.pid}
+    return {"connected": True, "pid": STATE.kd.proc.pid if STATE.kd.proc else None}
 
 
 @mcp.tool()
@@ -308,6 +547,64 @@ def detach() -> dict:
         STATE.kd.kill()
     STATE.kd = None
     return {"status": "disconnected"}
+
+
+@mcp.tool()
+def kernel_attach_pipe(
+    pipe_name: str = r"\\.\pipe\kdpipe",
+    timeout: int = 60,
+) -> dict:
+    """
+    Launch kd.exe connected over a named pipe (com:pipe transport).
+
+    Connects kd.exe to an existing named pipe (typically exposed by a VM's
+    virtual serial port).  All subsequent tools (breakpoints, memory reads,
+    etc.) work the same as with KDNET.
+
+    Args:
+        pipe_name: Windows named-pipe path (default ``\\\\.\\pipe\\kdpipe``).
+        timeout:   Seconds to wait for kd.exe to connect (default 60).
+
+    Returns: {status, kernel_version, output} or {status, message}
+    """
+    # Kill any previous session we know about.
+    if STATE.kd and STATE.kd.is_alive():
+        try:
+            STATE.kd.sendline("q")
+            time.sleep(0.4)
+        except Exception:
+            pass
+        STATE.kd.kill()
+    STATE.kd = None
+
+    # Kill stale kd.exe processes left over from a previous server instance
+    # that may still hold the kernel debug connection.
+    _kill_stale_kd(pipe_name)
+
+    # Let kd.exe connect to the VM's existing pipe as a client.
+    # -bonc      -- break on connection automatically (sends break packet natively).
+    # resets=0   -- don't send reset packets (avoids handshake confusion).
+    # reconnect  -- keep trying if the initial handshake fails.
+    args = [KD_EXE, "-bonc", "-k", f"com:pipe,port={pipe_name},resets=0,reconnect"]
+
+    try:
+        STATE.kd = KdProcess(args)
+    except OSError as exc:
+        return {"status": "error", "message": f"Failed to launch kd.exe: {exc}"}
+
+    try:
+        # Since we use -bonc, kd.exe will automatically break in as soon as it connects.
+        out = STATE.kd.expect(_PROMPT_RE, timeout=float(timeout))
+        ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
+        return {
+            "status": "connected",
+            "kernel_version": ver.group(0) if ver else "unknown",
+            "output": out[-600:].strip(),
+        }
+    except (TimeoutError, RuntimeError) as exc:
+        STATE.kd.kill()
+        STATE.kd = None
+        return {"status": "error", "message": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +904,7 @@ def main() -> None:
             print("Set KD_EXE environment variable to point to kd.exe.", file=sys.stderr)
             sys.exit(1)
 
-    print("kd MCP server starting (stdio)...", file=sys.stderr)
+    print("kd MCP server starting (stdio, named pipe available)...", file=sys.stderr)
     mcp.run()
 
 
