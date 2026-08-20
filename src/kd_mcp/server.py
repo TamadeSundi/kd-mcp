@@ -32,14 +32,42 @@ KD_EXE = os.environ.get(
 # kd.exe prompt variants: "kd> ", "0: kd> ", "1: kd> "
 _PROMPT_RE = re.compile(r"\d*:?\s*kd>\s*$")
 _CONNECTED_RE = re.compile(r"Kernel Debugger connection established", re.IGNORECASE)
-# Fired when the TCP/KDNET channel is up but the kernel hasn't broken yet.
-# Matches: "Connected to target 169.254.x.x on port 50000 on local IP ..."
-_TCP_CONNECTED_RE = re.compile(r"Connected to target .+ on port \d+", re.IGNORECASE)
-# Wait for either event; which one fired tells us whether we need to break in.
-_ANY_CONNECTED_RE = re.compile(
-    r"(Kernel Debugger connection established|Connected to target .+ on port \d+)",
-    re.IGNORECASE,
-)
+
+
+def _send_windows_ctrl_break(process_id: int) -> None:
+    """Send Ctrl+Break to a process running in a different Windows console."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.FreeConsole.argtypes = []
+    kernel32.FreeConsole.restype = wintypes.BOOL
+    kernel32.AttachConsole.argtypes = [wintypes.DWORD]
+    kernel32.AttachConsole.restype = wintypes.BOOL
+    kernel32.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.GenerateConsoleCtrlEvent.restype = wintypes.BOOL
+
+    # kd.exe is launched with CREATE_NEW_CONSOLE. GenerateConsoleCtrlEvent can
+    # only target a process group in the caller's current console, so attach to
+    # the debugger's console before sending CTRL_BREAK_EVENT.
+    kernel32.FreeConsole()
+    attached = False
+    try:
+        if not kernel32.AttachConsole(process_id):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attached = True
+        if not kernel32.GenerateConsoleCtrlEvent(
+            signal.CTRL_BREAK_EVENT, process_id
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Keep the console attached briefly so Windows can deliver the event.
+        time.sleep(0.25)
+    finally:
+        if attached:
+            kernel32.FreeConsole()
+        # Restore the server's parent console when one exists. The MCP stdio
+        # pipes remain valid even when the OpenSSH process has no console.
+        kernel32.AttachConsole(wintypes.DWORD(-1).value)
 
 # ---------------------------------------------------------------------------
 # KdProcess -- subprocess wrapper with expect-style I/O
@@ -133,10 +161,7 @@ class KdProcess:
 
     def send_break(self) -> None:
         """Send Ctrl+Break to kd.exe -- triggers kernel break-in over KDNET."""
-        try:
-            os.kill(self.proc.pid, signal.CTRL_BREAK_EVENT)
-        except Exception:
-            pass
+        _send_windows_ctrl_break(self.proc.pid)
 
     def is_alive(self) -> bool:
         return self.proc.poll() is None
@@ -490,8 +515,10 @@ def kernel_attach(
         if remaining <= 0:
             break
         try:
-            # Since we use -bonc, kd.exe will automatically break in as soon as it connects.
-            out = STATE.kd.expect(_PROMPT_RE, timeout=remaining)
+            # A running target may establish KDNET without stopping at a kd>
+            # prompt. Return once the debugger reports a completed handshake;
+            # callers can then use break_in to stop the target explicitly.
+            out = STATE.kd.expect(_CONNECTED_RE, timeout=remaining)
             ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
             return {
                 "status": "connected",
