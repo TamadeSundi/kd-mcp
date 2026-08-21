@@ -488,6 +488,7 @@ def kernel_attach(
         STATE.kd.kill()
     STATE.kd = None
 
+    connect_string = os.path.expandvars(connect_string)
     args = [KD_EXE, "-bonc", "-k", connect_string]
 
     try:
