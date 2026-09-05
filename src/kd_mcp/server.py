@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from enum import Enum
 from typing import Optional, Union
 
 from mcp.server.fastmcp import FastMCP
@@ -32,6 +33,18 @@ KD_EXE = os.environ.get(
 # kd.exe prompt variants: "kd> ", "0: kd> ", "1: kd> "
 _PROMPT_RE = re.compile(r"\d*:?\s*kd>\s*$")
 _CONNECTED_RE = re.compile(r"Kernel Debugger connection established", re.IGNORECASE)
+_DIAGNOSTIC_CONNECT_STRING = re.compile(r"(?im)\bnet:[^\r\n]*")
+_DIAGNOSTIC_KEY_VALUE = re.compile(
+    r"(?im)(\bkey\s*[:=]\s*)[^,;\r\n]*"
+)
+_COUNTER_MAX = (1 << 31) - 1
+
+
+class _ReaderTerminal(str, Enum):
+    NONE = "NONE"
+    EOF = "EOF"
+    OS_ERROR = "OS_ERROR"
+    VALUE_ERROR = "VALUE_ERROR"
 
 
 def _send_windows_ctrl_break(process_id: int) -> None:
@@ -101,6 +114,15 @@ class KdProcess:
         self._buf = ""
         self._lock = threading.Lock()
         self._ev = threading.Event()
+        self._reader_terminal = _ReaderTerminal.NONE
+        self._reader_errno: Optional[int] = None
+        self._reader_winerror: Optional[int] = None
+        self._command_channel_usable = True
+        self._command_sequence = 0
+        self._command_failures = 0
+        self._prompt_timeouts = 0
+        self._active_command: Optional[int] = None
+        self._last_timeout_command: Optional[int] = None
         self._th = threading.Thread(target=self._reader, daemon=True, name="kd-reader")
         self._th.start()
 
@@ -112,18 +134,107 @@ class KdProcess:
                 # read1: returns whatever is in the pipe buffer immediately;
                 # blocks only until at least 1 byte is available.
                 chunk = self.proc.stdout.read1(4096)  # type: ignore[attr-defined]
-            except (OSError, ValueError):
-                self._ev.set()
+            except OSError as exc:
+                self._set_reader_terminal(_ReaderTerminal.OS_ERROR, exc)
+                break
+            except ValueError as exc:
+                self._set_reader_terminal(_ReaderTerminal.VALUE_ERROR, exc)
                 break
             if not chunk:
-                if self.proc.poll() is not None:
-                    self._ev.set()
-                    break
-                time.sleep(0.01)
-                continue
+                # Blocking subprocess stdout returns b"" only at EOF. Treat it
+                # as terminal even if kd.exe itself has not exited.
+                self._set_reader_terminal(_ReaderTerminal.EOF)
+                break
             with self._lock:
                 self._buf += chunk.decode("utf-8", errors="replace")
             self._ev.set()
+
+    @staticmethod
+    def _bounded_increment(value: int) -> int:
+        return min(_COUNTER_MAX, value + 1)
+
+    def _set_reader_terminal(
+        self, terminal: _ReaderTerminal, error: Optional[BaseException] = None
+    ) -> None:
+        with self._lock:
+            if self._reader_terminal is _ReaderTerminal.NONE:
+                self._reader_terminal = terminal
+                errno = getattr(error, "errno", None)
+                winerror = getattr(error, "winerror", None)
+                self._reader_errno = errno if isinstance(errno, int) else None
+                self._reader_winerror = (
+                    winerror if isinstance(winerror, int) else None
+                )
+                self._command_channel_usable = False
+        self._ev.set()
+
+    def _health_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            snapshot: dict[str, object] = {
+                "reader_terminal": self._reader_terminal.value,
+                "reader_errno": self._reader_errno,
+                "reader_winerror": self._reader_winerror,
+                "command_channel_usable": self._command_channel_usable,
+                "command_sequence": self._command_sequence,
+                "command_failures": self._command_failures,
+                "prompt_timeouts": self._prompt_timeouts,
+                "active_command": self._active_command,
+                "last_timeout_command": self._last_timeout_command,
+            }
+        snapshot["reader_thread_alive"] = self._th.is_alive()
+        return snapshot
+
+    def _health_diagnostic(self) -> str:
+        health = self._health_snapshot()
+        return " ".join(
+            f"{name}={health[name] if health[name] is not None else 'none'}"
+            for name in (
+                "reader_terminal",
+                "reader_errno",
+                "reader_winerror",
+                "reader_thread_alive",
+                "command_channel_usable",
+                "command_sequence",
+                "command_failures",
+                "prompt_timeouts",
+                "active_command",
+                "last_timeout_command",
+            )
+        )
+
+    def _begin_prompt_command(self) -> int:
+        with self._lock:
+            if (
+                self._reader_terminal is not _ReaderTerminal.NONE
+                or not self._command_channel_usable
+                or self._active_command is not None
+            ):
+                raise RuntimeError("kd.exe command channel is not usable")
+            self._command_sequence = self._bounded_increment(
+                self._command_sequence
+            )
+            self._active_command = self._command_sequence
+            return self._command_sequence
+
+    def _finish_prompt_command(
+        self, command: int, *, succeeded: bool, timed_out: bool = False
+    ) -> None:
+        with self._lock:
+            if self._active_command != command:
+                self._command_channel_usable = False
+                self._active_command = None
+                return
+            self._active_command = None
+            if not succeeded:
+                self._command_failures = self._bounded_increment(
+                    self._command_failures
+                )
+                self._command_channel_usable = False
+            if timed_out:
+                self._prompt_timeouts = self._bounded_increment(
+                    self._prompt_timeouts
+                )
+                self._last_timeout_command = command
 
     # -- public API ----------------------------------------------------------
 
@@ -141,6 +252,16 @@ class KdProcess:
                 self._buf = ""
             if pattern.search(accumulated):
                 return accumulated
+            health = self._health_snapshot()
+            if health["reader_terminal"] != _ReaderTerminal.NONE.value:
+                raise RuntimeError(
+                    "kd.exe output reader stopped; " + self._health_diagnostic()
+                )
+            if health["reader_thread_alive"] is not True:
+                raise RuntimeError(
+                    "kd.exe output reader is not running; "
+                    + self._health_diagnostic()
+                )
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     f"kd.exe exited (code {self.proc.returncode}). "
@@ -164,7 +285,13 @@ class KdProcess:
         _send_windows_ctrl_break(self.proc.pid)
 
     def is_alive(self) -> bool:
-        return self.proc.poll() is None
+        health = self._health_snapshot()
+        return (
+            self.proc.poll() is None
+            and health["reader_terminal"] == _ReaderTerminal.NONE.value
+            and health["reader_thread_alive"] is True
+            and health["command_channel_usable"] is True
+        )
 
     def kill(self) -> None:
         for fn in (self.proc.stdin.close, self.proc.terminate, self.proc.kill):
@@ -411,7 +538,14 @@ mcp = FastMCP("kd")
 # ---------------------------------------------------------------------------
 
 def _require() -> Union[KdProcess, KdNamedPipe]:
-    if STATE.kd is None or not STATE.kd.is_alive():
+    if STATE.kd is None:
+        raise RuntimeError("Not connected -- call kernel_attach first.")
+    if not STATE.kd.is_alive():
+        if isinstance(STATE.kd, KdProcess):
+            raise RuntimeError(
+                "Not connected -- kd.exe channel is unusable; "
+                + STATE.kd._health_diagnostic()
+            )
         raise RuntimeError("Not connected -- call kernel_attach first.")
     return STATE.kd
 
@@ -419,9 +553,25 @@ def _require() -> Union[KdProcess, KdNamedPipe]:
 def _cmd(cmd: str, timeout: float = 20.0) -> str:
     """Send a command, wait for the next kd> prompt, return output (prompt stripped)."""
     kd = _require()
-    kd.drain()
-    kd.sendline(cmd)
-    raw = kd.expect(_PROMPT_RE, timeout=timeout)
+    command = kd._begin_prompt_command() if isinstance(kd, KdProcess) else None
+    try:
+        kd.drain()
+        kd.sendline(cmd)
+        raw = kd.expect(_PROMPT_RE, timeout=timeout)
+    except TimeoutError as exc:
+        if command is not None:
+            kd._finish_prompt_command(command, succeeded=False, timed_out=True)
+            raise TimeoutError(
+                f"{exc} Command health: {kd._health_diagnostic()}"
+            ) from exc
+        raise
+    except BaseException:
+        if command is not None:
+            kd._finish_prompt_command(command, succeeded=False)
+        raise
+    else:
+        if command is not None:
+            kd._finish_prompt_command(command, succeeded=True)
     # Strip the trailing prompt and leading echo of our command.
     out = _PROMPT_RE.sub("", raw).strip()
     # Remove first line if it looks like the command echo.
@@ -429,6 +579,15 @@ def _cmd(cmd: str, timeout: float = 20.0) -> str:
     if lines and lines[0].strip() == cmd.strip():
         out = "\n".join(lines[1:]).strip()
     return out
+
+
+def _redact_diagnostic_error(value: str) -> str:
+    """Keep list_modules diagnostics free of KDNET connection material."""
+
+    return _DIAGNOSTIC_KEY_VALUE.sub(
+        r"\1[REDACTED]",
+        _DIAGNOSTIC_CONNECT_STRING.sub("[REDACTED]", value),
+    )
 
 
 def _kill_stale_kd(pipe_name: str) -> None:
@@ -478,13 +637,16 @@ def kernel_attach(
 
     Returns: {status, kernel_version, attempts, output} or {status, message}
     """
-    # Kill any previous session.
-    if STATE.kd and STATE.kd.is_alive():
-        try:
-            STATE.kd.sendline("q")
-            time.sleep(0.4)
-        except Exception:
-            pass
+    # Dispose every prior wrapper, including a live kd.exe whose output
+    # channel was marked unusable.  Dropping only the Python reference would
+    # leave that stale debugger able to claim a later KDNET boot handshake.
+    if STATE.kd:
+        if STATE.kd.is_alive():
+            try:
+                STATE.kd.sendline("q")
+                time.sleep(0.4)
+            except Exception:
+                pass
         STATE.kd.kill()
     STATE.kd = None
 
@@ -558,7 +720,16 @@ def kernel_attach(
 @mcp.tool()
 def status() -> dict:
     """Return current debugger connection state."""
-    if STATE.kd is None or not STATE.kd.is_alive():
+    if STATE.kd is None:
+        return {"connected": False}
+    if not STATE.kd.is_alive():
+        if isinstance(STATE.kd, KdProcess):
+            # A terminal reader or desynchronized command channel can coexist
+            # with a live kd.exe.  Make connected=false an authoritative
+            # disposal boundary rather than leaving a stale listener behind.
+            unusable = STATE.kd
+            STATE.kd = None
+            unusable.kill()
         return {"connected": False}
     return {"connected": True, "pid": STATE.kd.proc.pid if STATE.kd.proc else None}
 
@@ -595,13 +766,15 @@ def kernel_attach_pipe(
 
     Returns: {status, kernel_version, output} or {status, message}
     """
-    # Kill any previous session we know about.
-    if STATE.kd and STATE.kd.is_alive():
-        try:
-            STATE.kd.sendline("q")
-            time.sleep(0.4)
-        except Exception:
-            pass
+    # Kill any previous session we know about, including an unusable process
+    # wrapper whose kd.exe may still be alive.
+    if STATE.kd:
+        if STATE.kd.is_alive():
+            try:
+                STATE.kd.sendline("q")
+                time.sleep(0.4)
+            except Exception:
+                pass
         STATE.kd.kill()
     STATE.kd = None
 
@@ -854,7 +1027,7 @@ def list_modules(pattern: str = "") -> dict:
     try:
         return {"output": _cmd(cmd, timeout=30)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": _redact_diagnostic_error(str(exc))}
 
 
 @mcp.tool()
